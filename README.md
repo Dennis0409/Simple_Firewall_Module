@@ -2,15 +2,16 @@
 
 ## 📅 Overview
 
-The **Simple Firewall Module** is a Linux Kernel module designed to manage basic firewall rules through user-space interactions. It allows users to **add**, **delete**, and **list** firewall rules via a custom CLI tool (`main`). This project demonstrates the integration of **Netfilter** in the Linux kernel for packet filtering and provides a simple interface for rule management through the `/proc` filesystem.
+The **Simple Firewall Module** is a Linux Kernel module designed to manage basic firewall rules through user-space interactions. It allows users to **add**, **delete**, and **list** firewall rules via a custom CLI tool (`main`). This project demonstrates the integration of Netfilter in the Linux kernel for packet filtering and the integration of **Netlink** in the Linux kernel for efficient two-way communication between user space and kernel space.
 
 ---
 
 ## 📊 Features
 
-- **Add Firewall Rules:** Block on IP, port, and protocol.
+- **Add Firewall Rules:** Block or allow traffic based on IP, port, and protocol.
 - **Delete Rules:** Remove specific firewall rules dynamically.
 - **List Rules:** Display all currently active firewall rules.
+- **Uses Netlink for Efficient Kernel-User Communication**
 - **Supports TCP, UDP, and ICMP Protocols.**
 
 ---
@@ -91,7 +92,7 @@ Expected log outputs:
 
 ```bash
 add rule: IP=192.168.1.1, Port=80, Protocol=TCP
-Del rule: IP=192.168.1.1, Port=80, Protocol=TCP
+del rule: IP=192.168.1.1, Port=80, Protocol=TCP
 ```
 
 ---
@@ -100,6 +101,8 @@ Del rule: IP=192.168.1.1, Port=80, Protocol=TCP
 
 - **Packet Filtering:** Integrated with Netfilter hooks.
 - **Rule Storage:** Uses linked lists for dynamic rule management.
-- **/proc Interface:** Exposes `/proc/fw_rules` for user-space interaction.
+- **Netlink Communication:** Uses `NETLINK_USER` to exchange messages between user-space and kernel-space.
+
+---
 
 

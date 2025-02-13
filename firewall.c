@@ -7,6 +7,8 @@
 #include <linux/list.h>
 #include <linux/proc_fs.h>
 #include <linux/inet.h>
+#include <net/sock.h>
+#include <linux/netlink.h>
 
 struct fw_rule{
     __be32 ip;
@@ -16,9 +18,12 @@ struct fw_rule{
 };
 
 #define PROC_ENTRY "/proc/block_list"
+#define NETLINK_USER 31
+
 static LIST_HEAD(rule_list);
 static struct nf_hook_ops nfho;
 static struct proc_dir_entry* proc_entry;
+struct sock* nl_sk = NULL;
 
 char* protocol_to_string(__u8 protocol){
     switch(protocol){
@@ -61,19 +66,72 @@ unsigned int hook_func(void *priv,struct sk_buff *skb,const struct nf_hook_state
     return NF_ACCEPT;
 }
 
-static ssize_t proc_write(struct file* filp, const char __user* buf, size_t len, loff_t *ppos){
-    char kbuf[64];
+static void send_msg_to_user(int pid, const char* msg, int msg_len){
+    struct sk_buff *skb;
+    struct nlmsghdr *nlh;
+    int chunk_size, offset = 0;
+
+    while (offset < msg_len) {
+        chunk_size = min(msg_len - offset, 1024);  // 每次傳 1024 Bytes
+        skb = nlmsg_new(chunk_size, GFP_KERNEL);
+        if (!skb) {
+            printk(KERN_ERR "Failed to allocate skb\n");
+            return;
+        }
+
+        nlh = nlmsg_put(skb, 0, 0, NLMSG_DONE, chunk_size, 0);
+        memcpy(nlmsg_data(nlh), msg + offset, chunk_size);
+
+        if (netlink_unicast(nl_sk, skb, pid, MSG_DONTWAIT) < 0) {
+            printk(KERN_ERR "Failed to send Netlink message\n");
+        }
+
+        offset += chunk_size;
+    }
+}
+
+static void nl_recv_msg(struct sk_buff* skb){
+    struct nlmsghdr* nlh;
+    char* kbuf;
     char ip_str[64];
     int port;
     char protocol[8];
     char action[8];
+    int user_id;
     struct fw_rule* new_rule;
 
-    if(len >= sizeof(kbuf)) return -EINVAL;
-    if(copy_from_user(kbuf,buf,len)) return -EFAULT;
+    nlh = (struct nlmsghdr*)skb->data;
+    kbuf = (char*)nlmsg_data(nlh);
+    user_id = nlh->nlmsg_pid;
 
-    kbuf[len]='\0';
-    if(sscanf(kbuf,"%s %15s %d %7s",action,ip_str,&port,protocol)!=4) return -EINVAL;
+    if(strcmp("ls",kbuf) == 0){
+        char* buf;
+        int len = 0;
+        struct fw_rule* rule;
+        buf = vmalloc(16 * PAGE_SIZE);  // 分配較大的緩衝區
+        if (!buf) {
+            printk(KERN_ERR "Failed to allocate memory\n");
+            return;
+        }
+        list_for_each_entry(rule, &rule_list, list){
+            len += scnprintf(buf+len, 16*PAGE_SIZE - len, "IP: %pI4, Protocol: %s, Port: %d\n",&rule->ip, protocol_to_string(rule->protocol), ntohs(rule->port));
+            if(len >= (16*PAGE_SIZE-1)) break;
+        }
+        if(len != 0){
+            buf[len] = '\0';
+            send_msg_to_user(user_id,buf,len);
+        }else{
+            strcpy(buf,"NO rule...\n");
+            send_msg_to_user(user_id,buf,strlen("NO rule...\n"));
+        }
+        vfree(buf);
+        return ;
+    }
+    else if(sscanf(kbuf,"%s %15s %d %7s",action,ip_str,&port,protocol)!=4){
+        printk(KERN_ERR "input error\n");
+        send_msg_to_user(user_id,"Input error\n",strlen("Input error\n"));
+        return ;
+    }
     if(strcmp("del",action) == 0){
         struct fw_rule* rule;
         __be32 del_ip = in_aton(ip_str);
@@ -83,11 +141,13 @@ static ssize_t proc_write(struct file* filp, const char __user* buf, size_t len,
                 list_del(&rule->list);
                 kfree(rule);
                 printk(KERN_INFO "Del rule IP = %s Port = %d Protocol = %s\n",ip_str,port,protocol);
-                return len;
+                send_msg_to_user(user_id,"Delete successful\n",strlen("Delete successful\n"));
+                return ;
             }
         }
         printk(KERN_INFO "Not Find rule.....\n");
-        return len;
+        send_msg_to_user(user_id,"Not Find rule.....\n",strlen("Not Find rule.....\n"));
+        return ;
     }
     new_rule = kmalloc(sizeof(*new_rule),GFP_KERNEL);
     new_rule->ip = in_aton(ip_str);
@@ -102,40 +162,15 @@ static ssize_t proc_write(struct file* filp, const char __user* buf, size_t len,
         new_rule->port = 0;
     }else{
         kfree(new_rule);
-        return -EINVAL;
+        send_msg_to_user(user_id, "Protocol error\n",strlen("Protocol error\n"));
+        printk(KERN_ERR "Protocol error\n");
+        return ;
     }
     INIT_LIST_HEAD(&new_rule->list);
     list_add(&new_rule->list,&rule_list);
     printk(KERN_INFO "%s IP %s, Port %d Protocol %s\n",action,ip_str,port,protocol);
-    return len;
+    send_msg_to_user(user_id, "Add successful\n",strlen("Add successful\n"));
 }
-
-static ssize_t proc_read(struct file* filp, char __user* buf, size_t count, loff_t* ppos){
-    static int finish = 0;
-    struct fw_rule* rule;
-    char* kbuf;
-    int len=0;
-
-    if(finish){
-        finish = 0;
-        return 0;
-    }
-    kbuf = kmalloc(PAGE_SIZE, GFP_KERNEL);
-    list_for_each_entry(rule, &rule_list, list){
-        len += scnprintf(kbuf+len, PAGE_SIZE - len, "IP: %pI4, Protocol: %s, Port: %d\n",&rule->ip, protocol_to_string(rule->protocol), ntohs(rule->port));
-        if(len >= PAGE_SIZE) break;
-    }
-
-    if(copy_to_user(buf,kbuf,len)) return -EFAULT;
-    kfree(kbuf);
-    finish = 1;
-    return len;
-}
-
-static const struct proc_ops proc_op = {
-    .proc_write = proc_write,
-    .proc_read = proc_read,
-};
 
 static int __init fw_init(void){
     nfho.hook = hook_func;
@@ -144,11 +179,15 @@ static int __init fw_init(void){
     nfho.pf = PF_INET;
     nf_register_net_hook(&init_net, &nfho);
 
-    proc_entry = proc_create(PROC_ENTRY,0666,NULL,&proc_op);
-    if (!proc_entry) {
-        pr_err("Failed to create /proc/%s\n", PROC_ENTRY);
+    struct netlink_kernel_cfg cfg={
+        .input = nl_recv_msg,
+    };
+    nl_sk = netlink_kernel_create(&init_net, NETLINK_USER, &cfg);
+    if(!nl_sk){
+        printk(KERN_INFO "Error create netlink\n");
         return -ENOMEM;
     }
+
     printk(KERN_INFO "Firewall loaded....\n");
     return 0;
 }
@@ -162,7 +201,8 @@ static void __exit fw_exit(void){
         list_del(&rule->list);
         kfree(rule);
     }
-    remove_proc_entry(PROC_ENTRY,NULL);
+
+    netlink_kernel_release(nl_sk);
     printk(KERN_INFO "Firewall unloaded....\n");
 }
 
